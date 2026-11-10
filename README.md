@@ -13,7 +13,7 @@ The Academic Registrar at Mbarara University of Science and Technology (MUST) is
 
 ### The Challenge
 
-**Choose one registrar process** (e.g., examination results, applications, student records, class attendance, transcripts, course registration, graduation clearance, or any other registrar workflow).
+**Choose one registrar process** (e.g., examination  results, applications, student records, class attendance, transcripts, course registration, graduation clearance, or any other registrar workflow).
 
 **As a team:**
 1. Identify the problem and discuss it thoroughly
