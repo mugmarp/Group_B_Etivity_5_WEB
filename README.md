@@ -75,7 +75,7 @@ The Academic Registrar at Mbarara University of Science and Technology (MUST) is
 | 7 | Mugendawala Mark Paul | 2025/BSE/108/PS | — | [@mugmarp](https://github.com/mugmarp) |
 | 8 | Katto Andrew | 2025/BSE/085/PS | — | — |
 | 9 | Nabaweesi Patricia Mirembe | 2025/BSE/120/PS | — | [@2025bse120-sketch](https://github.com/2025bse120-sketch) |
-| 10 | Matovu Edwine Levi | 2025/BSE/105/PS | — | [@Edwinelevi](https://github.com/Edwinelevi) |
+| 10 | Matovu Edwine Levi | 2025/BSE/105/PS | matovuedwinelevi@gmail.com | [@Edwinelevi](https://github.com/Edwinelevi) |
 | 11 | AMEN JOEL OSUTA | 2025/BSE/152/PS | — | [@amenosuta](https://github.com/amenosuta) |
 
 ---
