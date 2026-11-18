@@ -2,7 +2,6 @@ import { z } from "zod";
 export function filters(query) {
   return z
     .object({
-      practice: z.enum(["all", "only", "exclude"]).default("all"),
       faculty: z.string().max(40).optional(),
       programme: z.string().max(12).optional(),
       group: z.string().max(120).optional(),
@@ -28,7 +27,6 @@ export function courseWhere(f) {
   const scoped = f.faculty || f.programme || f.group || f.year;
   return {
     AND: [
-      ...(f.practice === "only" ? [{ isPractice: true }] : f.practice === "exclude" ? [{ isPractice: false }] : []),
       ...(scoped
         ? [
             {

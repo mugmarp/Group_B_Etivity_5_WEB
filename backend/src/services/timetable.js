@@ -1,4 +1,3 @@
-import { roomLock, roomBooking, resolveRoom } from "./rooms.js";
 import { prisma } from "../config/db.js";
 import { digest, json, dateValue, audit } from "./academic.js";
 import { minute } from "./timetable-source.js";
@@ -138,12 +137,6 @@ async function build(tx, input) {
       (s) =>
         s.timetableEntryId === entry?.id && dateValue(s.timetableDate) === date,
     );
-    try {
-      await roomBooking(tx, room, desired.startTime, desired.endTime, existing ? [existing.id] : [], course.isPractice);
-    } catch (error) {
-      if (!(error instanceof ConflictError)) throw error;
-      blockers.push(`${date}: ${error.message}`);
-    }
     const overlap = sessions.find(
       (s) =>
         s.id !== existing?.id &&
@@ -285,7 +278,6 @@ export async function previewTimetable(actor, input) {
 export async function applyTimetable(actor, id) {
   return prisma.$transaction(
     async (tx) => {
-      await roomLock(tx);
       await tx.$queryRaw`SELECT id FROM "TimetableReview" WHERE id=${id} FOR UPDATE`;
       const review = await tx.timetableReview.findUnique({ where: { id } });
       if (!review) throw new NotFoundError("Review not found");
@@ -308,13 +300,6 @@ export async function applyTimetable(actor, id) {
       if (built.plan.blockers.length)
         throw new ConflictError("Resolve all preview blockers before applying");
       const { entryData, entryId, items } = built.plan;
-      const venue = await resolveRoom(tx, entryData.room);
-      entryData.roomId = venue?.id || null;
-      const offering = await tx.course.findUniqueOrThrow({ where: { id: entryData.courseId } });
-      const replaced = items.filter(i => ["UPDATE", "CANCEL"].includes(i.action)).map(i => i.id);
-      for (const item of items.filter(i => ["CREATE", "UPDATE"].includes(i.action))) {
-        Object.assign(item, await roomBooking(tx, item.room, item.startTime, item.endTime, replaced, offering.isPractice));
-      }
       const entry = entryId
         ? await tx.timetableEntry.update({
             where: { id: entryId },
@@ -332,7 +317,6 @@ export async function applyTimetable(actor, id) {
               startTime: new Date(item.startTime),
               endTime: new Date(item.endTime),
               room: item.room,
-              roomId: item.roomId || null,
               sessionType: item.sessionType,
             },
           });
@@ -343,7 +327,6 @@ export async function applyTimetable(actor, id) {
               startTime: new Date(item.startTime),
               endTime: new Date(item.endTime),
               room: item.room,
-              roomId: item.roomId || null,
               sessionType: item.sessionType,
               version: { increment: 1 },
               checkinSecret: null,

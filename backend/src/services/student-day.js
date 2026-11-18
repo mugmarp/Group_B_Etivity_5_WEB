@@ -97,13 +97,6 @@ export function weeklyEvents(rows, group, now = new Date()) {
       endTime: new Date(e.endTime).toISOString(),
     }));
 }
-export function referenceInTerm(metadata, reference, civilDay) {
-  return (
-    metadata.academic_year === reference.academicYear &&
-    civilDay >= reference.lecturesBegin &&
-    civilDay <= reference.semesterEnds
-  );
-}
 export async function studentDay(studentId) {
   const now = new Date(),
     user = await prisma.user.findUniqueOrThrow({
@@ -122,6 +115,7 @@ export async function studentDay(studentId) {
       attendances: { where: { studentId }, select: { status: true } },
     },
     orderBy: { startTime: "asc" },
+    take: 100,
   });
   const group =
     user.studyGroupKey ||
@@ -134,7 +128,9 @@ export async function studentDay(studentId) {
   const metadata = publication.metadata;
   const reference = await calendarReference(),
     civilDay = kampalaDay(now);
-  const withinReference = referenceInTerm(metadata, reference, civilDay);
+  const withinReference =
+    metadata.academic_year !== reference.academicYear ||
+    (civilDay >= reference.lecturesBegin && civilDay <= reference.semesterEnds);
   const compatible =
     withinReference &&
     (!user.studyAcademicYear ||
