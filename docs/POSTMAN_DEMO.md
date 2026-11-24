@@ -1,6 +1,6 @@
 # Live Postman presentation
 
-The collection is an assessed deliverable: it contains 134 documented requests, saved sample responses and executable success/failure assertions. Run it in order against a **disposable, seeded** database. It creates synthetic accounts, course offerings, enrollments and dated classes; it does not erase them. Every run uses unique identifiers so the collection can be repeated.
+The collection is an assessed deliverable: it contains 129 documented requests, saved sample responses and executable success/failure assertions. Run it in order against a **disposable, seeded** database. It creates synthetic accounts, course offerings, enrollments and dated classes; it does not erase them. Every run uses unique identifiers so the collection can be repeated.
 
 ## Setup
 
@@ -82,9 +82,3 @@ The academic structure extension adds eleven requests to verify catalogue/regist
 ## Current account-management extension
 
 The latest 23 requests cover an isolated recovery account, protected management routes, registrar reauthentication/reasons, temporary-password restrictions, password changes, disable/reactivate behavior and revocation of access/refresh sign-ins. Current regression total: **129 requests and 337 assertions**. Earlier totals in the phase sections above are historical. The recent audit identified additional provisioning and validation defects; this collection has not yet been extended with those regression cases, and its success does not mean those defects are fixed.
-
-## Postman validation contribution, 12 November 2026
-
-The updated collection passed **134 requests and 362 assertions, zero failures**, against a local disposable PostgreSQL 16 database. The five additional requests reject missing login passwords, malformed login emails, missing current passwords, unexpected privilege fields during password changes, and reuse of the current password. They run after the initial logins; subsequent administrator operations also verify that the rejected changes leave its sign-in usable.
-
-All 134 requests now have a saved response example. New examples were captured from the passing local run and sanitized; the stale missing-email example was refreshed. The saved PDF example records its status and content type with an empty body because binary output is omitted. Examples do not replace live assertions. See [the validation record](../postman/VALIDATION.md) and [Postman setup and troubleshooting](../postman/README.md).

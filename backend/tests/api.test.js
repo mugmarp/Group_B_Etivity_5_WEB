@@ -28,6 +28,10 @@ before(async () => {
   process.env.JWT_SECRET = "test-access-secret-at-least-32-characters";
   process.env.JWT_REFRESH_SECRET = "test-refresh-secret-at-least-32-characters";
   app = (await import("../src/app.js")).default;
+  await db.mockHistoryBatch.deleteMany();
+  await db.studentCourseSetup.deleteMany();
+  await db.coursePlanItem.deleteMany();
+  await db.coursePlan.deleteMany();
   await db.auditEvent.deleteMany();
   await db.reportSnapshot.deleteMany();
   await db.timetableReview.deleteMany();
@@ -39,6 +43,7 @@ before(async () => {
   await db.enrollment.deleteMany();
   await db.session.deleteMany();
   await db.timetableEntry.deleteMany();
+  await db.room.deleteMany();
   await db.academicTerm.deleteMany();
   await db.timetablePublication.deleteMany();
   await db.courseAudience.deleteMany();
@@ -2034,4 +2039,529 @@ test("concurrent password changes cannot overwrite a newer credential", async ()
     (await db.user.findUniqueOrThrow({ where: { id: user.id } })).authVersion,
     1,
   );
+});
+
+test("published programme plans automate compulsory enrollment, constrain electives and preserve withdrawals", async () => {
+  const year = new Date().getUTCFullYear(),
+    academicYear = `${year}/${year + 1}`;
+  const startsOn = new Date(Date.now() - 86400000 * 2),
+    endsOn = new Date(Date.now() + 86400000 * 20);
+  // Earlier timetable tests use future terms; this fixture supplies a current one.
+  const existingTerms = await db.academicTerm.findMany();
+  for (const t of existingTerms)
+    await db.academicTerm.update({
+      where: { id: t.id },
+      data: {
+        startsOn: new Date(Date.now() + 86400000 * 90),
+        endsOn: new Date(Date.now() + 86400000 * 100),
+      },
+    });
+  const term = await db.academicTerm.create({
+    data: {
+      academicYear: `${year + 10}/${year + 11}`,
+      semester: 2,
+      startsOn,
+      endsOn,
+      excludedDates: [],
+      sourceUrl: "https://example.test/approved",
+      sourceNote: "Isolated course-plan test",
+    },
+  });
+  // Use an independent academic year to avoid pre-existing timetable term uniqueness.
+  const intake = year + 9;
+  const teacher = await db.user.findUniqueOrThrow({
+    where: { email: "teacher@test.example" },
+  });
+  const adminUser = await db.user.findUniqueOrThrow({
+    where: { email: "admin@test.example" },
+  });
+  const passwordHash = await bcrypt.hash("TestPassword2026!", 4);
+  const learner = await db.user.create({
+    data: {
+      name: "Course Plan Learner",
+      email: "plan-learner@test.example",
+      regNo: `${intake}/BCS/9001/PS`,
+      programmeCode: "BCS",
+      role: "STUDENT",
+      passwordHash,
+    },
+  });
+  const peer = await db.user.create({
+    data: {
+      name: "Course Plan Peer",
+      email: "plan-peer@test.example",
+      regNo: `${intake}/BCS/9002/PS`,
+      programmeCode: "BCS",
+      role: "STUDENT",
+      passwordHash,
+    },
+  });
+  const outsider = await db.user.create({
+    data: {
+      name: "Other Programme",
+      email: "plan-other@test.example",
+      regNo: `${intake}/BSE/9003/PS`,
+      programmeCode: "BSE",
+      role: "STUDENT",
+      passwordHash,
+    },
+  });
+  const createCourse = async (code, group = "BCS II", isPractice = false) =>
+    db.course.create({
+      data: {
+        code,
+        title: code + " Course",
+        academicYear: term.academicYear,
+        semester: 2,
+        program: group.split(" ")[0],
+        programmeCode: group.split(" ")[0],
+        year: 2,
+        examinerId: teacher.id,
+        isPractice,
+        audiences: { create: { groupKey: group } },
+      },
+    });
+  const required = await createCourse("PLANREQ"),
+    elective = await createCourse("PLANELEC"),
+    otherCourse = await createCourse("PLANOTHER", "BSE II"),
+    practice = await createCourse("PLAN-P");
+  const adminToken = await login(adminUser.email);
+  const headers = auth(adminToken);
+  const input = {
+    termId: term.id,
+    groupKey: "BCS II",
+    expectedVersion: 0,
+    reason: "Publish approved test curriculum",
+    items: [
+      { courseId: required.id, compulsory: true },
+      { courseId: elective.id, compulsory: false },
+    ],
+  };
+  let plan;
+  try {
+    assert.equal(
+      (
+        await request(app)
+          .post("/api/admin/course-plans/preview")
+          .set(headers)
+          .send({
+            ...input,
+            items: [{ courseId: otherCourse.id, compulsory: true }],
+          })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await request(app)
+          .post("/api/admin/course-plans/preview")
+          .set(headers)
+          .send({
+            ...input,
+            items: [{ courseId: practice.id, compulsory: true }],
+          })
+      ).status,
+      400,
+    );
+    const preview = await request(app)
+      .post("/api/admin/course-plans/preview")
+      .set(headers)
+      .send(input);
+    assert.equal(preview.status, 200, JSON.stringify(preview.body));
+    const bad = await request(app)
+      .post("/api/admin/course-plans/publish")
+      .set(headers)
+      .send({
+        ...input,
+        previewHash: preview.body.previewHash,
+        currentPassword: "incorrect",
+      });
+    assert.equal(bad.status, 401);
+    const published = await request(app)
+      .post("/api/admin/course-plans/publish")
+      .set(headers)
+      .send({
+        ...input,
+        previewHash: preview.body.previewHash,
+        currentPassword: "TestPassword2026!",
+      });
+    assert.equal(published.status, 201, JSON.stringify(published.body));
+    plan = published.body;
+    assert.equal(
+      await db.enrollment.count({ where: { studentId: learner.id } }),
+      0,
+    );
+    const studentToken = await login(learner.email);
+    let enrollments = await db.enrollment.findMany({
+      where: { studentId: learner.id },
+    });
+    assert.equal(enrollments.length, 1);
+    assert.equal(enrollments[0].courseId, required.id);
+    assert.equal(enrollments[0].origin, "COURSE_PLAN");
+    const { kampalaDay } = await import("../src/services/rules.js");
+    assert.equal(
+      enrollments[0].effectiveFrom.toISOString().slice(0, 10),
+      kampalaDay(),
+    );
+    const learnerProfile = await db.user.findUnique({
+      where: { id: learner.id },
+    });
+    assert.equal(learnerProfile.studyGroupKey, "BCS II");
+    await Promise.all([login(learner.email), login(learner.email)]);
+    assert.equal(
+      await db.enrollment.count({ where: { studentId: learner.id } }),
+      1,
+    );
+    assert.equal(
+      (
+        await request(app)
+          .post("/api/admin/course-plans/preview")
+          .set(auth(studentToken))
+          .send(input)
+      ).status,
+      403,
+    );
+    const body = {
+      confirm: true,
+      planId: plan.id,
+      version: plan.version,
+      electives: [elective.id],
+    };
+    assert.equal(
+      (
+        await request(app)
+          .post("/api/student/course-setup")
+          .set(auth(studentToken))
+          .send({ ...body, electives: [otherCourse.id] })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await request(app)
+          .post("/api/student/course-setup")
+          .set(auth(studentToken))
+          .send({ ...body, version: 99 })
+      ).status,
+      409,
+    );
+    const confirmed = await request(app)
+      .post("/api/student/course-setup")
+      .set(auth(studentToken))
+      .send(body);
+    assert.equal(confirmed.status, 200);
+    assert.ok(confirmed.body.confirmedAt);
+    assert.equal(confirmed.body.courses.filter((c) => c.enrolled).length, 2);
+    const withdrawnAt = new Date(Date.now() - 86400000);
+    withdrawnAt.setUTCHours(0, 0, 0, 0);
+    await db.enrollment.update({
+      where: { id: enrollments[0].id },
+      data: { effectiveUntil: withdrawnAt },
+    });
+    const reloaded = await request(app)
+      .post("/api/student/course-setup")
+      .set(auth(studentToken))
+      .send({});
+    assert.equal(reloaded.status, 200);
+    assert.equal(
+      reloaded.body.courses.find((c) => c.id === required.id).enrolled,
+      false,
+    );
+    await login(learner.email);
+    assert.equal(
+      (
+        await db.enrollment.findUnique({ where: { id: enrollments[0].id } })
+      ).effectiveUntil.getTime(),
+      withdrawnAt.getTime(),
+    );
+    const outsideToken = await login(outsider.email);
+    const pending = await request(app)
+      .post("/api/student/course-setup")
+      .set(auth(outsideToken))
+      .send({});
+    assert.equal(pending.body.status, "PLAN_PENDING");
+    assert.equal(
+      await db.enrollment.count({ where: { studentId: outsider.id } }),
+      0,
+    );
+    const batch = await request(app)
+      .post("/api/admin/course-plans/batch-preview")
+      .set(headers)
+      .send({ planId: plan.id });
+    assert.equal(batch.status, 200, JSON.stringify(batch.body));
+    assert.equal(batch.body.rows.length, 2);
+    assert.ok(batch.body.rows.find((r) => r.id === peer.id).newCourses === 1);
+    const applied = await request(app)
+      .post("/api/admin/course-plans/batch-apply")
+      .set(headers)
+      .send({
+        planId: plan.id,
+        previewHash: batch.body.previewHash,
+        currentPassword: "TestPassword2026!",
+        reason: "Assign reviewed cohort courses",
+      });
+    assert.equal(applied.status, 200, JSON.stringify(applied.body));
+    assert.equal(applied.body.inserted, 1);
+    const stale = await request(app)
+      .post("/api/admin/course-plans/batch-apply")
+      .set(headers)
+      .send({
+        planId: plan.id,
+        previewHash: batch.body.previewHash,
+        currentPassword: "TestPassword2026!",
+        reason: "Retry stale cohort preview",
+      });
+    assert.equal(stale.status, 409);
+    const auditEvents = await db.auditEvent.findMany({
+      where: {
+        kind: "COURSE_PLAN_ENROLLMENT",
+        entityId: {
+          in: (
+            await db.enrollment.findMany({
+              where: { studentId: { in: [learner.id, peer.id] } },
+            })
+          ).map((e) => e.id),
+        },
+      },
+    });
+    assert.equal(auditEvents.length, 3);
+    assert.ok(!JSON.stringify(auditEvents).includes("TestPassword2026!"));
+  } finally {
+    await db.studentCourseSetup.deleteMany({
+      where: { studentId: { in: [learner.id, peer.id, outsider.id] } },
+    });
+    if (plan) {
+      await db.coursePlanItem.deleteMany({ where: { planId: plan.id } });
+      await db.coursePlan.delete({ where: { id: plan.id } });
+    }
+    await db.enrollment.deleteMany({
+      where: { studentId: { in: [learner.id, peer.id, outsider.id] } },
+    });
+    await db.courseAudience.deleteMany({
+      where: {
+        courseId: {
+          in: [required.id, elective.id, otherCourse.id, practice.id],
+        },
+      },
+    });
+    await db.course.deleteMany({
+      where: {
+        id: { in: [required.id, elective.id, otherCourse.id, practice.id] },
+      },
+    });
+    await db.user.deleteMany({
+      where: { id: { in: [learner.id, peer.id, outsider.id] } },
+    });
+    await db.academicTerm.delete({ where: { id: term.id } });
+    for (const t of existingTerms)
+      await db.academicTerm.update({
+        where: { id: t.id },
+        data: { startsOn: t.startsOn, endsOn: t.endsOn },
+      });
+  }
+});
+
+test("report enrollment boundaries use Kampala dates independently of the PostgreSQL session timezone", async () => {
+  const teacher = await db.user.findUniqueOrThrow({
+    where: { email: "teacher@test.example" },
+  });
+  const c = await db.course.create({
+    data: {
+      code: "EAT" + randomUUID().slice(0, 6),
+      title: "Kampala midnight boundary",
+      program: "BSE",
+      year: 2,
+      academicYear: "2026/2027",
+      semester: 1,
+      examinerId: teacher.id,
+      enrollments: {
+        create: {
+          studentId,
+          effectiveFrom: new Date("2026-11-13T00:00:00Z"),
+          effectiveUntil: new Date("2026-11-14T00:00:00Z"),
+        },
+      },
+    },
+  });
+  try {
+    for (const instant of [
+      "2026-11-12T20:30:00Z",
+      "2026-11-12T22:00:00Z",
+      "2026-11-13T22:00:00Z",
+    ])
+      await db.session.create({
+        data: {
+          courseId: c.id,
+          naturalKey: "eat:" + randomUUID(),
+          startTime: new Date(instant),
+          endTime: new Date(Date.parse(instant) + 1800000),
+          status: "COMPLETED",
+        },
+      });
+    const { courseReport, getStudentAttendanceSummary } = await import(
+      "../src/services/eligibility.js"
+    );
+    for (const tz of ["UTC", "Africa/Kampala", "America/New_York"]) {
+      const report = await db.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT set_config('TimeZone',${tz},true)`;
+        return courseReport(tx, c.id);
+      });
+      assert.equal(report.students[0].totalSessions, 1, tz);
+    }
+    const summary = await getStudentAttendanceSummary(studentId);
+    assert.equal(summary.find((r) => r.courseId === c.id).totalSessions, 1);
+  } finally {
+    await db.session.deleteMany({ where: { courseId: c.id } });
+    await db.enrollment.deleteMany({ where: { courseId: c.id } });
+    await db.course.delete({ where: { id: c.id } });
+  }
+});
+
+test("code windows and accepted submissions are audited without plaintext codes or secrets", async () => {
+  const teacher = await db.user.findUniqueOrThrow({
+    where: { email: "teacher@test.example" },
+  });
+  const c = await db.course.create({
+    data: {
+      code: "AUD" + randomUUID().slice(0, 6),
+      title: "Window audit verification",
+      program: "BSE",
+      year: 2,
+      academicYear: "2026/2027",
+      semester: 1,
+      examinerId: teacher.id,
+      enrollments: { create: { studentId } },
+    },
+  });
+  const s = await db.session.create({
+    data: {
+      courseId: c.id,
+      naturalKey: "audit:" + randomUUID(),
+      startTime: new Date(Date.now() - 60000),
+      endTime: new Date(Date.now() + 3600000),
+    },
+  });
+  const actor = { userId: teacher.id, role: "EXAMINER" };
+  const { manageSession, submitCheckin } = await import(
+    "../src/services/attendance.js"
+  );
+  try {
+    const code = await manageSession(actor, s.id, "start");
+    await manageSession(actor, s.id, "start");
+    assert.equal(
+      await db.auditEvent.count({
+        where: { entityId: s.id, kind: "CHECKIN_WINDOW_OPEN" },
+      }),
+      1,
+    );
+    const first = await submitCheckin(studentId, s.id, code.code);
+    await submitCheckin(studentId, s.id, code.code);
+    await manageSession(actor, s.id, "stop");
+    const events = await db.auditEvent.findMany({
+      where: { entityId: { in: [s.id, first.attendance.id] } },
+    });
+    assert.deepEqual(events.map((e) => e.kind).sort(), [
+      "CHECKIN_WINDOW_CLOSE",
+      "CHECKIN_WINDOW_OPEN",
+      "CODE_ATTENDANCE_RECORDED",
+    ]);
+    const saved = JSON.stringify(events);
+    assert.ok(!saved.includes(code.code));
+    assert.ok(!saved.includes("checkinSecret"));
+  } finally {
+    await db.attendance.deleteMany({ where: { sessionId: s.id } });
+    await db.enrollment.deleteMany({ where: { courseId: c.id } });
+    await db.session.delete({ where: { id: s.id } });
+    await db.course.delete({ where: { id: c.id } });
+  }
+});
+
+test("workspace bundles the authenticated student's initial view without exposing code secrets", async () => {
+  const token = await login("learner@test.example");
+  const day = await request(app).post("/api/auth/workspace").send({ view: "student-day" }).set(auth(token));
+  assert.equal(day.status, 200);
+  assert.equal(day.body.user.id, studentId);
+  assert.equal(day.body.timeZone, "Africa/Kampala");
+  assert.ok(day.body.now && Array.isArray(day.body.day.classes));
+  assert.equal(JSON.stringify(day.body).includes('"checkinSecret"'), false);
+  assert.equal(JSON.stringify(day.body).includes('"passwordHash"'), false);
+  assert.match(day.headers['server-timing'], /workspace;dur=/);
+  assert.equal(day.headers['cache-control'], 'no-store');
+  const summary = await request(app).post("/api/auth/workspace").send({ view: "student-summary" }).set(auth(token));
+  assert.equal(summary.status, 200);
+  assert.ok(Array.isArray(summary.body.summary));
+});
+
+test("workspace validates view/identity and does not return student data to other roles", async () => {
+  assert.equal((await request(app).post('/api/auth/workspace')).status, 401);
+  const token = await login("teacher@test.example");
+  for (const body of [{ view: 'invalid' }, { view: 'profile', studentId }])
+    assert.equal((await request(app).post('/api/auth/workspace').send(body).set(auth(token))).status, 400);
+  const result = await request(app).post('/api/auth/workspace').send({ view: 'student-day' }).set(auth(token));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.user.role, 'EXAMINER');
+  assert.equal(result.body.day, undefined);
+});
+
+test("workspace returns temporary-password restrictions and rejects a revoked account", async () => {
+  const sample = await db.user.findUniqueOrThrow({ where: { id: studentId } });
+  const email = `workspace-${randomUUID()}@test.example`;
+  const user = await db.user.create({ data: { name: 'Restricted workspace student', email, role: 'STUDENT', passwordHash: sample.passwordHash, mustChangePassword: true } });
+  const token = await login(email);
+  const result = await request(app).post('/api/auth/workspace').send({ view: 'student-day' }).set(auth(token));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.user.mustChangePassword, true);
+  assert.equal(result.body.day, undefined);
+  await db.user.update({ where: { id: user.id }, data: { authVersion: { increment: 1 } } });
+  assert.equal((await request(app).post('/api/auth/workspace').set(auth(token))).status, 401);
+});
+
+test("room catalogue requires registrar review and rejects duplicate aliases", async () => {
+  const token = await login("admin@test.example"), learner = await login("learner@test.example");
+  const body = {code:"ROOM-"+randomUUID().slice(0,8).toUpperCase(),name:"Room "+randomUUID(),aliases:["Alias "+randomUUID()],reviewStatus:"REFERENCE",isActive:true,sourceNote:"Verified test room source",reason:"Review test room"};
+  assert.equal((await request(app).post('/api/admin/rooms').set(auth(learner)).send(body)).status,403);
+  assert.equal((await request(app).post('/api/admin/rooms').set(auth(token)).send(body)).status,400);
+  const saved=await request(app).post('/api/admin/rooms').set(auth(token)).send({...body,reviewStatus:"REVIEWED"});
+  assert.equal(saved.status,201);
+  assert.equal((await request(app).post('/api/admin/rooms').set(auth(token)).send({...body,code:body.code+"X",name:body.name+"X",reviewStatus:"REVIEWED"})).status,409);
+  const list=await request(app).get('/api/rooms?search='+encodeURIComponent(body.name)).set(auth(learner));
+  assert.equal(list.body[0].id,saved.body.id);
+  assert.equal(list.body[0].capacity,null);
+});
+
+test("reviewed room booking detects conflicts across offerings and accepts non-overlap", async () => {
+  const {roomBooking,roomLock}=await import('../src/services/rooms.js');
+  const room=await db.room.create({data:{code:"BOOK-"+randomUUID(),name:"Booking "+randomUUID(),aliases:[],reviewStatus:"REVIEWED",isActive:true,sourceNote:"Test reviewed venue"}});
+  const start=new Date(Date.now()+86400000), end=new Date(start.getTime()+3600000);
+  const saved=await db.session.create({data:{courseId,naturalKey:"room:"+randomUUID(),startTime:start,endTime:end,roomId:room.id,room:room.name}});
+  await assert.rejects(()=>db.$transaction(async tx=>{await roomLock(tx);await roomBooking(tx,room.name,start,end);}),/overlaps another/);
+  const next=await db.$transaction(tx=>roomBooking(tx,room.name,end,new Date(end.getTime()+3600000)));
+  assert.equal(next.roomId,room.id);
+  assert.equal((await db.$transaction(tx=>roomBooking(tx,room.name,start,end,[saved.id]))).roomId,room.id);
+});
+
+test("historical mock import is audited, enrolment-aware, repeatable and rejects real identities", async () => {
+  const {previewMockHistory,applyMockHistory}=await import('../src/services/mock-history.js');
+  const registrar = await db.user.findUniqueOrThrow({where:{email:"admin@test.example"}});
+  const hash=(await db.user.findUniqueOrThrow({where:{id:studentId}})).passwordHash;
+  const teacher=await db.user.create({data:{email:randomUUID()+"@test.example",name:"Synthetic lecturer",role:"EXAMINER",dataOrigin:"SYNTHETIC",passwordHash:hash}});
+  const learner=await db.user.create({data:{email:randomUUID()+"@test.example",name:"Synthetic history learner",role:"STUDENT",year:2,dataOrigin:"SYNTHETIC",studyAcademicYear:"2020/2021",studySemester:1,passwordHash:hash}});
+  const term=await db.academicTerm.create({data:{academicYear:"2020/2021",semester:1,startsOn:new Date('2020-08-01'),endsOn:new Date('2020-12-01'),excludedDates:[{date:"2020-08-03",reason:"Test exclusion"}],sourceUrl:"https://example.org/calendar",sourceNote:"Isolated mock history test"}});
+  const source=await db.course.create({data:{code:"HIST"+randomUUID().slice(0,6),title:"Historical mock test",program:"BSE",year:2,semester:1,academicYear:term.academicYear,examinerId:teacher.id}});
+  const input={batchKey:"test-history:"+randomUUID(),termId:term.id,sourceCourseId:source.id,sourceNote:"Synthetic reconstruction for isolated integration test",studentIds:[learner.id],from:"2020-08-01",to:"2020-08-31",sessions:[{key:"class-one",startTime:"2020-08-04T08:00:00+03:00",endTime:"2020-08-04T10:00:00+03:00",room:"Reference lab",sessionType:"LAB",status:"COMPLETED"},{key:"class-two",startTime:"2020-08-05T08:00:00+03:00",endTime:"2020-08-05T10:00:00+03:00",room:null,sessionType:"LECTURE",status:"CANCELLED"}]};
+  await assert.rejects(()=>previewMockHistory(db,{...input,studentIds:[studentId]},registrar.id),/synthetic student/);
+  await assert.rejects(()=>previewMockHistory(db,{...input,sessions:[{...input.sessions[0],startTime:"2020-08-03T08:00:00+03:00",endTime:"2020-08-03T10:00:00+03:00"}]},registrar.id),/excluded/);
+  await assert.rejects(()=>previewMockHistory(db,{...input,sessions:[input.sessions[0],input.sessions[0]]},registrar.id),/Duplicate/);
+  const plan=await previewMockHistory(db,input,registrar.id);
+  assert.equal(await db.mockHistoryBatch.count({where:{batchKey:input.batchKey}}),0);
+  await assert.rejects(()=>applyMockHistory(db,input,registrar.id,'wrong-hash'),/preview changed/);
+  const result=await applyMockHistory(db,input,registrar.id,plan.fingerprint);
+  assert.equal(await db.attendance.count({where:{session:{courseId:result.courseId}}}),1);
+  assert.equal(await db.attendanceChange.count({where:{attendance:{session:{courseId:result.courseId}}}}),1);
+  const {getStudentAttendanceSummary}=await import('../src/services/eligibility.js');
+  const summary=(await getStudentAttendanceSummary(learner.id)).find(r=>r.courseId===result.courseId);
+  assert.equal(summary.totalSessions,1);assert.equal(summary.isPractice,true);
+  const replay=await applyMockHistory(db,input,registrar.id,plan.fingerprint);assert.equal(replay.alreadyApplied,true);
+  assert.equal(await db.attendance.count({where:{session:{courseId:result.courseId}}}),1);
+  await assert.rejects(()=>applyMockHistory(db,{...input,sourceNote:"Changed synthetic history source note"},registrar.id,plan.fingerprint),/different manifest/);
 });

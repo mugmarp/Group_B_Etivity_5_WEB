@@ -1,3 +1,4 @@
+import { roomLock, roomBooking } from "../services/rooms.js";
 import { passwordSchema } from "../utils/passwordPolicy.js";
 import {
   profileData,
@@ -131,6 +132,11 @@ router.post(
         .toUpperCase()
         .regex(/^[A-Z0-9][A-Z0-9-]{1,19}$/),
       title: z.string().trim().min(3).max(180),
+      offeringKey: z
+        .string()
+        .trim()
+        .regex(/^[A-Z0-9-]{1,40}$/)
+        .default("MAIN"),
       program: z.string().trim().min(1).max(30),
       year: z.number().int().min(1).max(10),
       semester: z.number().int().min(1).max(2),
@@ -281,10 +287,13 @@ router.post(
       throw new ForbiddenError("This course belongs to another examiner");
     res.status(201).json(
       await prisma.$transaction(async (tx) => {
+        await roomLock(tx);
         await tx.$queryRaw`SELECT id FROM "Course" WHERE id=${course.id} FOR UPDATE`;
+        const venue = await roomBooking(tx, req.body.room, req.body.startTime, req.body.endTime, [], course.isPractice);
         const saved = await tx.session.create({
           data: {
             ...req.body,
+            ...venue,
             startTime: new Date(req.body.startTime),
             endTime: new Date(req.body.endTime),
             courseId: course.id,
