@@ -1,15 +1,17 @@
+import * as workspaceState from "./common.js";
 import { dayModel, eventProgress } from "./day-model.js";
 import {
   $,
   escape,
   time,
   init,
+  coursesReady,
   showError,
   notice,
   currentDate,
   day,
 } from "./common.js";
-import { studentData, attempts, queue, remove, sync } from "./offline.js";
+import { studentData, saveSnapshot, attempts, queue, remove, sync } from "./offline.js";
 import {
   operations,
   enqueueOperation,
@@ -21,6 +23,7 @@ let dayData = null,
   candidateKey = "";
 let classes = [],
   reviewAttempt = null;
+let initialDay = workspaceState.workspaceData?.day, initialSummary = workspaceState.workspaceData?.summary;
 const summaryView = location.pathname.endsWith("/summary");
 function eventCard(event, title) {
   if (!event)
@@ -104,20 +107,35 @@ function renderDay() {
         .join("")
     : "<li>No published classes for today.</li>";
 }
-async function loadClasses() {
+let classFlight = null;
+function loadClasses() {
+  if (!classFlight) classFlight = readClasses().finally(() => { classFlight = null; });
+  return classFlight;
+}
+async function readClasses() {
   try {
-    // Retain the established snapshot/queue endpoint across this additive client update.
-    const [result, context] = await Promise.all([
-      studentData(user.id, "/student/sessions/upcoming"),
-      studentData(user.id, "/student/day"),
-    ]);
-    classes = result.data;
+    await coursesReady;
+    const context = initialDay ? { data: initialDay, cached: false }
+      : await studentData(user.id, "/student/day");
+    if (initialDay) {
+      initialDay = null;
+      await saveSnapshot(user.id, "/student/day", context.data).catch(() => {});
+    }
+    classes = context.data.classes;
     dayData = context.data;
-    dayCached = result.cached || context.cached;
+    dayCached = context.cached;
     renderDay();
+    $("#class-loading").hidden = true;
     if (!dayCached) showError(null);
   } catch (error) {
+    if (!dayData) {
+      $("#class-loading").textContent =
+        "Could not load your classes. Check your connection and try again.";
+      $("#checkin-form").hidden = true;
+    }
     showError(error);
+  } finally {
+    $("#checkin-view").setAttribute("aria-busy", "false");
   }
 }
 async function renderQueue() {
@@ -165,26 +183,30 @@ async function renderQueue() {
 }
 async function flush() {
   try {
+    const pending = (await attempts(user.id)).some((a) => a.state === "PENDING") ||
+      (await operations(user.id)).some((o) => o.state === "PENDING");
+    if (!pending) return;
     await sync(user.id);
     await syncOperations(user.id);
-    await loadReviewRequests();
-    await loadClasses();
-    await renderQueue();
+    await Promise.all([loadReviewRequests(), loadClasses(), renderQueue()]);
   } catch (error) {
     showError(error);
   }
 }
 async function loadSummary() {
   try {
-    const { data, cached } = await studentData(
-      user.id,
-      "/student/attendance/summary",
-    );
+    await coursesReady;
+    const { data, cached } = initialSummary ? { data: initialSummary, cached: false }
+      : await studentData(user.id, "/student/attendance/summary");
+    if (initialSummary) {
+      initialSummary = null;
+      await saveSnapshot(user.id, "/student/attendance/summary", data).catch(() => {});
+    }
     $("#summaries").innerHTML = data.length
       ? data
           .map(
             (c) =>
-              `<article class="card"><div class="spread"><div><p class="code">${escape(c.courseCode)}</p><h2>${escape(c.courseTitle)}</h2><p class="small muted">${escape(c.academicYear)} · Semester ${c.semester}</p></div><strong class="stat">${c.attendancePct === null ? "—" : c.attendancePct.toFixed(1) + "%"}</strong></div><p>${c.presentCount} attended / ${c.totalSessions} completed classes</p><div class="progress"><div class="${c.eligible ? "met" : ""}" style="width:${c.attendancePct || 0}%"></div></div><p class="small">${c.attendancePct === null ? "Not assessed: no completed classes." : c.eligible ? "Attendance requirement met (at least " + (c.attendanceThreshold || 80) + "%)." : "Below the " + (c.attendanceThreshold || 80) + "% attendance requirement."}</p></article>`,
+              `<article class="card"><div class="spread"><div><p class="code">${escape(c.courseCode)}</p><h2>${escape(c.courseTitle)}</h2>${c.isPractice ? '<p class="small">Synthetic practice history</p>' : ""}<p class="small muted">${escape(c.academicYear)} · Semester ${c.semester}</p></div><strong class="stat">${c.attendancePct === null ? "—" : c.attendancePct.toFixed(1) + "%"}</strong></div><p>${c.presentCount} attended / ${c.totalSessions} completed classes</p><div class="progress"><div class="${c.eligible ? "met" : ""}" style="width:${c.attendancePct || 0}%"></div></div><p class="small">${c.attendancePct === null ? "Not assessed: no completed classes." : c.eligible ? "Attendance requirement met (at least " + (c.attendanceThreshold || 80) + "%)." : "Below the " + (c.attendanceThreshold || 80) + "% attendance requirement."}</p></article>`,
           )
           .join("")
       : '<div class="card">You are not enrolled in any courses. Contact your administrator.</div>';
@@ -224,8 +246,8 @@ async function loadReviewRequests() {
 }
 if (user) {
   $("#review-section").hidden = false;
-  await loadReviewRequests();
-  setInterval(loadReviewRequests, 15000);
+  void loadReviewRequests();
+  setInterval(() => { if (!document.hidden) void loadReviewRequests(); }, 15000);
   addEventListener("sams:operations", () => {
     void loadReviewRequests();
     if (!summaryView) void renderQueue();
@@ -267,8 +289,6 @@ if (user) {
     setInterval(loadSummary, 15000);
   } else {
     $("#checkin-view").hidden = false;
-    await loadClasses();
-    await renderQueue();
     setInterval(() => {
       if (!document.hidden) void loadClasses();
     }, 10000);
@@ -284,7 +304,6 @@ if (user) {
       void sync(user.id).catch(showError);
     }, 3000);
     $("#send-pending").onclick = flush;
-    void flush();
     $("#code").oninput = () => {
       $("#code").value = $("#code").value.toUpperCase();
     };
@@ -329,5 +348,9 @@ if (user) {
         button.disabled = false;
       }
     };
+    // Bind actions before class data can reveal the form.
+    await loadClasses();
+    await renderQueue();
+    void flush();
   }
 }
